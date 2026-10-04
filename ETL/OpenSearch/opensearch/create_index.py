@@ -65,6 +65,16 @@ INDEX_BODY = {
             "embedding_model": {"type": "keyword"},
             "embedding_dim": {"type": "integer"},
             "security_scan": {"type": "object", "dynamic": True},
+            "crawler_metadata": {"type": "object", "enabled": False},
+            "kafka_receipt": {
+                "type": "object",
+                "dynamic": "strict",
+                "properties": {
+                    "topic": {"type": "keyword"},
+                    "partition": {"type": "integer"},
+                    "offset": {"type": "long"},
+                },
+            },
         },
     },
 }

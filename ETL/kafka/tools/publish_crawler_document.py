@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 
 from kafka import KafkaProducer
@@ -30,11 +31,11 @@ document = {
 }
 
 producer = KafkaProducer(
-    bootstrap_servers=["localhost:9092"],
+    bootstrap_servers=[os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")],
     key_serializer=lambda k: k.encode("utf-8"),
     value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
 )
 
-producer.send("crawled-documents", key=document["normalized_url"], value=document)
+producer.send("crawled-documents", key=document["normalized_url"], value=document).get(timeout=30)
 producer.flush()
 print("Sent 1 crawler document to topic 'crawled-documents'")

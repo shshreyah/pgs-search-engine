@@ -1,112 +1,44 @@
-"""ETL ingestion pipeline DAG.
+"""Consume full scraper Documents; save output before committing Kafka offsets."""
 
-This keeps the workflow self-contained inside ETL while the scraper, MinIO,
-PostgreSQL schema, OpenSearch mapping, and ClamAV pieces are still separate
-future work.
-"""
-
-from __future__ import annotations
-
-import json
+import os
 import sys
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 
 
-DFS_ROOT = Path("/opt/airflow/data/local_dfs_store")
-PROCESSED_OUTPUT = Path("/opt/airflow/data/processed/transformed_documents.jsonl")
-SPARK_LIB = "/opt/airflow/spark_lib"
-KAFKA_BOOTSTRAP = "kafka:29092"
-KAFKA_TOPIC = "scraped_files_topic"
-
-def _load_existing_records(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            records.append(json.loads(line))
-    return records
-
 @dag(
     dag_id="etl_ingestion_pipeline",
-    schedule=None,
+    schedule="* * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
+    max_active_runs=1,
+    default_args={"retries": 2, "retry_delay": timedelta(seconds=30)},
     tags=["etl", "ingestion", "kafka", "spark"],
 )
 def etl_ingestion_pipeline():
     @task
-    def poll_kafka_signal() -> dict:
-        from kafka import KafkaConsumer
+    def process_crawler_documents():
+        kafka_lib = "/opt/airflow/kafka_lib"
+        if kafka_lib not in sys.path:
+            sys.path.insert(0, kafka_lib)
+        from document_pipeline import run_pipeline
 
-        consumer = KafkaConsumer(
-            KAFKA_TOPIC,
-            bootstrap_servers=[KAFKA_BOOTSTRAP],
-            auto_offset_reset="earliest",
-            enable_auto_commit=True,
-            group_id="etl-ingestion-pipeline",
-            consumer_timeout_ms=8000,
-            value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+        results = run_pipeline(
+            brokers=os.getenv("KAFKA_BROKERS", "kafka:29092"),
+            topic="crawled-documents",
+            group="etl-document-pipeline-v1",
+            database="/opt/airflow/data/processed/pipeline.sqlite3",
+            output="/opt/airflow/data/processed/crawled_documents.jsonl",
+            max_messages=10,
+            with_embedding=True,
         )
-        try:
-            for message in consumer:
-                signal = message.value
-                if "object_key" not in signal:
-                    raise ValueError("Kafka signal must include object_key")
-                return signal
-        finally:
-            consumer.close()
-        raise AirflowSkipException("No new file-ready signal on Kafka")
+        if not results:
+            raise AirflowSkipException("No new crawler documents on Kafka")
+        return results
 
-    @task
-    def transform_document(signal: dict) -> dict:
-        if SPARK_LIB not in sys.path: # to make sure Python can find custom modules/files inside SPARK_LIB
-            sys.path.insert(0, SPARK_LIB)
+    process_crawler_documents()
 
-        from transform import add_embeddings, mark_duplicates, transform_file
-
-        transformed = transform_file(signal, DFS_ROOT, with_embedding=False)
-        existing = _load_existing_records(PROCESSED_OUTPUT)
-        marked = mark_duplicates([*existing, transformed])
-        record = marked[-1]
-
-        if record["duplicate"]:
-            canonical = next(
-                (
-                    document
-                    for document in existing
-                    if document.get("document_id") == record["duplicate_of"]
-                ),
-                None,
-            )
-            if canonical and canonical.get("embedding"):
-                for field in ("embedding", "embedding_model", "embedding_dim"):
-                    record[field] = canonical.get(field)
-        else:
-            add_embeddings([record])
-
-        return record
-
-    @task
-    def persist_transformed_document(record: dict) -> dict:
-        if SPARK_LIB not in sys.path:
-            sys.path.insert(0, SPARK_LIB)
-
-        from transform import append_jsonl
-
-        append_jsonl(PROCESSED_OUTPUT, [record])
-        print(json.dumps(record, ensure_ascii=False, indent=2))
-        return {
-            "document_id": record["document_id"],
-            "output": str(PROCESSED_OUTPUT),
-            "duplicate": record["duplicate"],
-            "duplicate_type": record["duplicate_type"],
-        }
-
-    persist_transformed_document(transform_document(poll_kafka_signal()))
 
 etl_ingestion_pipeline()

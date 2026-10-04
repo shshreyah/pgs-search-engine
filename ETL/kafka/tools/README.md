@@ -1,69 +1,61 @@
-# Kafka Utilities
+# Full-document ETL handoff
 
-These scripts simulate the scraper side of the ETL handoff while the scraper
-itself is not part of this local ETL setup.
+The supported ingestion contract is `crawled-documents`, keyed by
+`normalized_url`, with the scraper Document JSON as the value.
+Airflow and the local command both use `document_pipeline.py`.
+The old file-signal publisher is a legacy diagnostic tool, not this DAG's input.
 
-## Start Kafka
+## Lightweight local test (PowerShell, repository root)
 
-Preferred:
-
-```bash
-cd ETL
-docker compose up --build
+```powershell
+.\.venv-etl\Scripts\python.exe .\ETL\kafka\tools\publish_crawler_document.py
+.\.venv-etl\Scripts\python.exe .\ETL\kafka\document_pipeline.py --no-embeddings
 ```
 
-Kafka is exposed on `localhost:9092`.
+This validates and transforms text and metadata, detects duplicate content,
+and saves raw receipts and transformed records in SQLite. It atomically exports
+a JSONL snapshot before committing Kafka. The smoke test uses a separate group,
+`smoke.sqlite3`, and `smoke_documents.jsonl` in the processed folder. Production
+uses `pipeline.sqlite3` and `crawled_documents.jsonl`.
+`--no-embeddings` is a smoke test only; it does not prove embedding generation
+or OpenSearch indexing. Use separate database/output paths and a new Kafka
+consumer group for a later test with real embeddings.
 
-## Send A File-Ready Signal
+## Airflow
 
-This is the main signal used by the Airflow DAG `etl_ingestion_pipeline`.
+The DAG runs once per minute, in batches of up to ten messages, with embeddings
+required. Install/rebuild the Airflow image first. The first model download can
+use substantial disk space and memory. The shared Kafka library is mounted
+into Airflow by Compose. SQLite and the output are in the mounted processed
+folder. Raw-file scanning remains in `transform_file`; the full-document path
+uses text already extracted by the scraper and does not claim to scan the
+original downloaded files.
 
-```bash
-cd ETL
-docker compose run --rm ingestion-signal-publisher
+The optional OpenSearch indexer reads `crawled_documents.jsonl`. Run that
+service explicitly after transformed output exists; loading a Kafka receipt
+alone is not proof of indexing.
+
+## Durability and retries
+
+Transformation and receipt insertion are one SQLite transaction. Transformation
+failures roll back and do not commit Kafka offsets. Malformed documents are
+durably rejected. Reprocessing the same topic/partition/offset returns the
+existing result without transforming twice. A repeated payload at a new offset
+is a new receipt, with content duplication marked by the transform helpers.
+The JSONL snapshot is recoverable from SQLite after an export/acknowledgement
+failure. SQLite/JSONL use local single-writer coordination; this is not a
+multi-host distributed storage implementation.
+
+`consumer.py` remains a receipt-only diagnostic command and retains its own
+consumer group. It does not run transformation or claim complete ETL success.
+
+## Tests
+
+```powershell
+.\.venv-etl\Scripts\python.exe -m unittest discover -s .\ETL\kafka -p "test_*.py" -v
 ```
 
-The signal points to `ETL/airflow/data/local_dfs_store/sample.html` and is
-published to `scraped_files_topic`.
-
-If you prefer running the host Python script directly, install this folder's
-requirements first:
-
-```bash
-cd ETL/kafka
-pip install -r requirements.txt
-python tools/publish_ingestion_signal.py
-```
-
-## Test The Durable Receipt Consumer
-
-The receipt consumer validates full crawler `Document` JSON messages and stores
-loaded/rejected receipts in SQLite. It is separate from content-level
-deduplication, which belongs to `ETL/spark/transform.py`.
-
-```bash
-cd ETL/kafka
-python tools/publish_crawler_document.py
-python consumer.py consume --database ./etl.sqlite3 --max-messages 1
-```
-
-For validation coverage:
-
-```bash
-python tools/publish_validation_documents.py
-python consumer.py consume --database ./etl.sqlite3 --max-messages 8
-```
-
-For offset-level idempotency:
-
-```bash
-python tools/validate_consumer_idempotency.py
-```
-
-## Local Unit Test
-
-From the repository root:
-
-```bash
-python -B ETL/kafka/test_consumer.py
-```
+The pipeline tests cover a real Document-shaped payload, durable output, offset
+replay, content duplicates, invalid keys, transient transformation failure,
+failed output export and failed Kafka acknowledgement. The scanner and real
+embedding/OpenSearch integration still require their separate integration runs.

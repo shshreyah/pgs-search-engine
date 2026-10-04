@@ -221,3 +221,5 @@ __marimo__/
 .claude/
 node_modules/
 dist/
+
+ETL/airflow/data/model_cache/

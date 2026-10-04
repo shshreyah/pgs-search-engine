@@ -57,7 +57,7 @@ services:
       OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
       OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-openpassword}
       OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-pgs_documents}
-      JSONL_PATH: /data/transformed_documents.jsonl
+      JSONL_PATH: /data/crawled_documents.jsonl
     volumes:
       - ./airflow/data/processed:/data:ro
     depends_on:
@@ -95,6 +95,10 @@ services:
       AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
       AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      CLAMD_HOST: clamav
+      CLAMD_PORT: "3310"
+      SPARK_LIB: /opt/airflow/spark_lib
+      HF_HOME: /opt/airflow/data/model_cache
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
       AIRFLOW__WEBSERVER__SECRET_KEY: "etl_dev_secret_change_me"
     volumes: &airflow-volumes
@@ -104,6 +108,8 @@ services:
       - ./airflow/config:/opt/airflow/config
       - ./airflow/data:/opt/airflow/data
       - ./spark:/opt/airflow/spark_lib:ro
+      - ./kafka:/opt/airflow/kafka_lib:ro
+      - ./kafka/tools:/opt/airflow/kafka_tools:ro
     user: "${AIRFLOW_UID:-50000}:0"
     depends_on:
       postgres:
@@ -172,39 +178,19 @@ services:
         condition: service_healthy
     restart: always
 
-  ingestion-signal-publisher:
+  crawler-document-publisher:
     build:
       context: ./airflow
     profiles:
       - tools
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
+    volumes:
+      - ./kafka/tools:/opt/airflow/kafka_tools:ro
     depends_on:
       kafka:
         condition: service_healthy
-    command:
-      - python
-      - -c
-      - |
-        from kafka import KafkaProducer
-        import json
-
-        signal = {
-            "bucket": "etl-file-store",
-            "object_key": "sample.html",
-            "target_domain": "example.gov.np",
-            "source_url": "https://example.gov.np/notices/sample",
-            "title": "Sample Municipality Notice",
-            "content_type": "text/html",
-        }
-        producer = KafkaProducer(
-            bootstrap_servers=["kafka:29092"],
-            key_serializer=lambda key: key.encode("utf-8"),
-            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-        )
-        producer.send("scraped_files_topic", key=signal["target_domain"], value=signal)
-        producer.flush()
-        print("Sent 1 file-ready ingestion signal to scraped_files_topic")
+    command: ["python", "/opt/airflow/kafka_tools/publish_crawler_document.py"]
 
 volumes:
   airflow-postgres-db:

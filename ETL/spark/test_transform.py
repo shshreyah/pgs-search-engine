@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from transform import (
@@ -60,7 +61,9 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(marked[1]["duplicate_type"], "exact_sha256")
         self.assertEqual(marked[2]["duplicate_type"], "simhash")
 
-    def test_transform_file_uses_local_dfs_signal(self):
+    @patch("security_scanner.scan_with_clamav",
+           return_value={"status": "CLEAN", "signature": None})
+    def test_transform_file_uses_local_dfs_signal(self, mock_scan):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sample.html").write_text(
